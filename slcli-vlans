@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+
+import SoftLayer
+
+
+class SoftLayerClient():
+
+    def __init__(self):
+        self.client = SoftLayer.Client()
+        self.vlans = None
+
+    def get_hardware(self, domain="", hostnames=[], hostname_prefix=""):
+        '''Fetches a list of the account's hardware objects, optionally filtering it client-side.'''
+
+        # fetch all hardware; include network components and their uplink component to save calls later
+        mask = "id,fullyQualifiedDomainName,hostname,domain,networkComponents[id,name,port,primaryIpAddress,uplinkComponent[id,networkVlanId,networkVlanTrunks]]"
+        try:
+            hardware = self.client["SoftLayer_Account"].getHardware(mask=mask)
+        except SoftLayer.SoftLayerAPIError as e:
+            sys.exit("Failed to get hardware list: faultCode=%s, faultString=%s" % (e.faultCode, e.faultString))
+
+        # filter results client-side
+        if domain:
+            hardware = [h for h in hardware if h["domain"] == domain]
+        if hostnames:
+            hardware = [h for h in hardware if h["hostname"] in hostnames]
+        elif hostname_prefix:
+            hardware = [h for h in hardware if h["hostname"].startswith(hostname_prefix)]
+        return hardware
+
+    def get_vlans(self):
+        '''Fetches a list of the account's VLAN objects.'''
+        if not self.vlans:
+            try:
+                self.vlans = self.client["SoftLayer_Account"].getNetworkVlans()
+            except SoftLayer.SoftLayerAPIError as e:
+                sys.exit("Failed to get network VLANs: faultCode=%s, faultString=%s" % (e.faultCode, e.faultString))
+        return self.vlans
+
+    def get_vlan_name(self, vlan_id):
+        '''Returns the VLAN name for a VLAN object id.'''
+        vlans = self.get_vlans()
+        for v in vlans:
+            if v["id"] == vlan_id:
+                return v.get("name", v.get("vlanNumber"))
+        return "---"
+
+    def to_vlan_numbers(self, vlan_names):
+        '''Converts a list of VLAN names to VLAN numbers, removing VLANs that don't exist.'''
+        vlans = self.get_vlans()
+        vlan_numbers = []
+        for n in vlan_names:
+            for v in vlans:
+                if (isinstance(n, int) and v["vlanNumber"] == n) or v["name"] == n:
+                    vlan_numbers.append(v["vlanNumber"])
+        return vlan_numbers
+
+    def get_nw_component(self, ip="", fqdn="", net="", intf=""):
+        '''Returns a network component with matching IP, FQDN+VLAN, or FQDN+interface.'''
+        if ip:
+            for h in self.get_hardware():
+                for c in h["networkComponents"]:
+                    if c.get("primaryIpAddress", "none") == ip:
+                        return c
+        elif fqdn and net:
+            hostname, domain = fqdn.split(".", 1)
+            for h in self.get_hardware(hostnames=[hostname], domain=domain):
+                for c in h["networkComponents"]:
+                    if "primaryIpAddress" not in c:
+                        continue
+                    if self.get_vlan_name(c["uplinkComponent"]["networkVlanId"]) == net:
+                        return c
+        elif fqdn and intf:
+            hostname, domain = fqdn.split(".", 1)
+            for h in self.get_hardware(hostnames=[hostname], domain=domain):
+                for c in h["networkComponents"]:
+                    if "primaryIpAddress" not in c:
+                        continue
+                    if "%s%s" % (c["name"], c["port"]) == intf:
+                        return c
+        return None
+
+    def get_vlan(self, nw_component):
+        '''Returns the native VLAN name of this network component. Must be a hardware's uplink component!'''
+        return self.client["Network_Component"].getNetworkVlan(id=nw_component["id"])["name"]
+
+    def get_vlan_trunks(self, nw_component):
+        '''Returns a list of VLAN names trunked to this network component. Must be a hardware's uplink component!'''
+        vlan_refs = self.client["Network_Component"].getNetworkVlanTrunks(id=nw_component["id"])
+        vlans = self.get_vlans()
+        vlan_names = []
+        for r in vlan_refs:
+            for v in vlans:
+                if v["id"] == r["networkVlanId"]:
+                    vlan_names.append(v["name"])
+        return vlan_names
+
+    def add_vlan_trunks(self, nw_component, vlan_names):
+        '''Adds a list of VLAN trunks this network component.'''
+        for v in self.to_vlan_numbers(vlan_names):
+            self.client["Network_Component"].addNetworkVlanTrunks([{"vlanNumber": v}], id=nw_component["id"])
+
+    def clear_vlan_trunks(self, nw_component):
+        '''Removes all VLANs trunked to this network component.'''
+        return self.client["Network_Component"].clearNetworkVlanTrunks(id=nw_component["id"])
+
+
+def print_records(records, fieldmask=[], as_json=False):
+    '''Prints records (list of dicts) in table or JSON format, using only fields contained in fieldmask.'''
+    if not fieldmask and len(records) > 0:
+        fieldmask = records[0].keys()
+    if as_json:
+        output = []
+        for r in records:
+            output.append(r)
+        print(output)
+    else:
+        widths = {i: len(i) for i in fieldmask}
+        for r in records:
+            for f in fieldmask:
+                widths[f] = max(widths[f], len(str(r.get(f, "---"))))
+
+        line = ""
+        for f in fieldmask:
+            line += f.ljust(widths[f], ' ') + " "
+        print(line)
+        print("-" * len(line))
+        for r in records:
+            line = ""
+            for f in fieldmask:
+                line += str(r.get(f, "---")).ljust(widths[f], ' ') + " "
+            print(line)
+
+
+def list_hardware(args):
+    if args.hostnames:
+        args.hostnames = args.hostnames.split(',')
+
+    client = SoftLayerClient()
+    hardware = client.get_hardware(domain=args.domain, hostnames=args.hostnames, hostname_prefix=args.hostname_prefix)
+
+    # flatten hardware info to show IPs and native VLANs of both front- and backend network interfaces.
+    records = []
+    for h in hardware:
+        record = {"id": h["id"], "fullyQualifiedDomainName": h["fullyQualifiedDomainName"]}
+        for c in h["networkComponents"]:
+            if "primaryIpAddress" not in c:
+                continue
+            interface = "%s%s" % (c["name"], c["port"])
+            record[interface + "_ip"] = c["primaryIpAddress"]
+            record[interface + "_net"] = client.get_vlan_name(c["uplinkComponent"]["networkVlanId"])
+        records.append(record)
+    print_records(records, "id,fullyQualifiedDomainName,eth0_ip,eth0_net,eth1_ip,eth1_net".split(','), args.json)
+
+
+def list_vlans(args):
+    client = SoftLayerClient()
+    print_records(client.get_vlans(), "id,name,vlanNumber".split(','), args.json)
+
+
+def get_vlan(args):
+    ip, fqdn, intf, net = parse_interface_identifier(args.interface)
+    client = SoftLayerClient()
+    nwc = client.get_nw_component(ip=ip, fqdn=fqdn, intf=intf, net=net)
+    if not nwc:
+        sys.exit("Interface %s not found." % args.interface)
+
+    print(client.get_vlan(nwc["uplinkComponent"]))
+
+
+def get_vlan_trunks(args):
+    ip, fqdn, intf, net = parse_interface_identifier(args.interface)
+    client = SoftLayerClient()
+    nwc = client.get_nw_component(ip=ip, fqdn=fqdn, intf=intf, net=net)
+    if not nwc:
+        sys.exit("Interface %s not found." % args.interface)
+
+    print(client.get_vlan_trunks(nwc["uplinkComponent"]))
+
+
+def add_vlan_trunks(args):
+    ip, fqdn, intf, net = parse_interface_identifier(args.interface)
+    client = SoftLayerClient()
+    nwc = client.get_nw_component(ip=ip, fqdn=fqdn, intf=intf, net=net)
+    if not nwc:
+        sys.exit("Interface %s not found." % args.interface)
+
+    client.add_vlan_trunks(nwc, args.vlans.split(','))
+    print(client.get_vlan_trunks(nwc["uplinkComponent"]))
+
+
+def clear_vlan_trunks(args):
+    ip, fqdn, intf, net = parse_interface_identifier(args.interface)
+    client = SoftLayerClient()
+    nwc = client.get_nw_component(ip=ip, fqdn=fqdn, intf=intf, net=net)
+    if not nwc:
+        sys.exit("Interface %s not found." % args.interface)
+
+    client.clear_vlan_trunks(nwc)
+    print(client.get_vlan_trunks(nwc["uplinkComponent"]))
+
+
+def parse_interface_identifier(interface):
+    '''Breaks up the interface identifier, return IP, FQDN, network name, and interface name components.'''
+    items = interface.split(',')
+    if len(items) == 1:
+        ip = items[0]
+        fqdn = ""
+        intf = ""
+        net = ""
+    else:
+        ip = ""
+        fqdn = items[0]
+        if items[1].startswith("eth"):
+            intf = items[1]
+            net = ""
+        else:
+            intf = ""
+            net = items[1]
+    return ip, fqdn, intf, net
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Use SoftLayer API to manage VLANs.")
+    parser.set_defaults(func=None)
+    subparsers = parser.add_subparsers()
+
+    parser_list_hardware = subparsers.add_parser("list_hardware", help="List the account's hardware")
+    parser_list_hardware.add_argument("--domain", help="filter results by domain name")
+    parser_list_hardware.add_argument("--hostnames", help="filter results by (comma-separated) list of hostnames")
+    parser_list_hardware.add_argument("--hostname-prefix", help="filter results by hostname prefix")
+    parser_list_hardware.add_argument("--json", help="print output in JSON format", action="store_true")
+    parser_list_hardware.set_defaults(func=list_hardware)
+
+    parser_list_vlans = subparsers.add_parser("list_vlans", help="List the account's VLANs")
+    parser_list_vlans.add_argument("--json", help="print output in JSON format", action="store_true")
+    parser_list_vlans.set_defaults(func=list_vlans)
+
+    parser_get_vlan = subparsers.add_parser("get_vlan", help="Get the native VLAN of a network interface")
+    parser_get_vlan.add_argument("interface", help="The target interface, identified by one of: IP address (e.g. '10.20.0.1') or host's FQDN and local interface name (e.g. 'node1.example.com,eth0').")
+    parser_get_vlan.set_defaults(func=get_vlan)
+
+    parser_get_vlan_trunks = subparsers.add_parser("get_vlan_trunks", help="Get VLANs trunked to a network interface")
+    parser_get_vlan_trunks.add_argument("interface", help="The target interface, identified by one of: IP address (e.g. '10.20.0.1'), host's FQDN and local interface name (e.g. 'node1.example.com,eth0'), or host's FQDN and native VLAN name (e.g. 'node1.example.com,cluster').")
+    parser_get_vlan_trunks.set_defaults(func=get_vlan_trunks)
+
+    parser_add_vlan_trunks = subparsers.add_parser("add_vlan_trunks", help="Add VLANs to be trunked to a network interface")
+    parser_add_vlan_trunks.add_argument("interface", help="The target interface, identified by one of: IP address (e.g. '10.20.0.1'), host's FQDN and local interface name (e.g. 'node1.example.com,eth0'), or host's FQDN and native VLAN name (e.g. 'node1.example.com,cluster').")
+    parser_add_vlan_trunks.add_argument("vlans", help="The comma-separated list of VLAN names/IDs to add")
+    parser_add_vlan_trunks.set_defaults(func=add_vlan_trunks)
+
+    parser_clear_vlan_trunks = subparsers.add_parser("clear_vlan_trunks", help="Remove all VLANs trunked to a network interface")
+    parser_clear_vlan_trunks.add_argument("interface", help="The target interface, identified by one of: IP address (e.g. '10.20.0.1'), host's FQDN and local interface name (e.g. 'node1.example.com,eth0'), or host's FQDN and native VLAN name (e.g. 'node1.example.com,cluster').")
+    parser_clear_vlan_trunks.set_defaults(func=clear_vlan_trunks)
+
+    args = parser.parse_args()
+    if not args.func:
+        parser.print_help()
+        sys.exit(1)
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    args.func(args)
